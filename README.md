@@ -69,33 +69,6 @@ Within the `NotificationHandler.java`:
 
 Please review individual Java files for detailed descriptions of each function and their respective usages.
 
-# Pulse BLE Core Module
-
-This module handles the Bluetooth Low Energy (BLE) scanning, connection management, and real-time data parsing for custom wearable bio-sensors (e.g., multi-wavelength PPG arrays and ECG trackers). It is designed to run continuously in the background, decode custom packet structures dynamically, and push biometric data to the UI and remote Sickbay servers.
-
-## 🏗️ Core Architecture
-
-* **`BLEHandlerService`**: A foreground Android Service that acts as the central manager for all BLE operations. It handles scanning via `BluetoothLeScanner`, manages concurrent connections through a `TattooConnectionManager`, and routes data to the `SickbayPushService`.
-* **`BLEDevice` (Base Class)**: Represents a connected sensor. It manages the connection state, logs connection/disconnection events to a `MarkerFile`, handles local data recording, and triggers a device-specific haptic vibration if the sensor drops offline unexpectedly.
-* **`BLETattooDevice`**: Inherits from `BLEDevice` to specifically handle continuous biometric streams. It processes raw Nordic UART Service (NUS) and Custom UART Service (CUS) packets, runs biometric algorithms, and broadcasts `PlotDataEvent` and `SickbaySendFloatsEvent` payloads via EventBus.
-* **`BLEPacketParser`**: A dynamic packet decoding engine. Instead of hardcoding data structures, it reads configuration rules from an `.init` file in the assets folder to determine signal order, byte size, endianness, signed/unsigned properties, and digital filter settings.
-* **`DebugBLEDevice`**: A mock device implementation that simulates a BLE connection (`00:00:00:00:00:00d`). It generates synthetic waveforms (Sine, Square, Sawtooth) based on the target `.init` file configuration to allow for offline UI and pipeline testing.
-* **`AlertStopReceiver`**: A `BroadcastReceiver` that captures the "Silence" action from the high-priority disconnect notification, allowing users to stop the haptic alarm without opening the app.
-
-## ✨ Key Features
-
-* **Dynamic Packet Parsing**: Instantiates a parser based on the device's Bluetooth name. Supports automatic bit-shifting, sign extension, and real-time data filtering.
-* **High-Priority Disconnect Alarms**: If a sensor drops connection unintentionally, the service triggers a looping 700ms/500ms haptic vibration and fires a max-priority system notification. The alarm is intentionally bypassed if the user manually requests a disconnect.
-* **Sickbay Integration**: Natively binds to `SickbayPushService` to map parsed float arrays to specific Sickbay IDs for live remote monitoring.
-* **Event-Driven UI Updates**: Uses `EventBus` to decouple the background service from the UI, broadcasting `ScanListUpdatedEvent`, `PlotDataEvent`, and `DeviceConnectionChangedEvent` for smooth graphing.
-
-## 🛠️ Adding a New Sensor
-
-To add support for a new custom BLE sensor (like a new PPG array version):
-1. Create an `.init` file in the `assets/inits/` directory defining the packet structure, notification frequency, and Sickbay IDs.
-2. Add the device's Bluetooth identifier and the corresponding `.init` filename to the `assets/inits/init_file_lookup.txt` table.
-3. The `BLEPacketParser` will automatically load the rules when the device connects.
-
 ## License
 
 Distributed under the MIT License. See `LICENSE` for more information.
