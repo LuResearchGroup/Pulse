@@ -216,11 +216,13 @@ public class BLEHandlerService extends Service {
         EventBus.getDefault().unregister(this);
         mConnectionManager.unregister();
 
-        //Unbind from the SickbayPushService
+        //Unbind from and explicitly stop the SickbayPushService so it tears down its socket and
+        //releases the WiFi + partial wake locks (prevents permanent battery drain).
         if (mIsBound) {
             unbindService(sickbayPushConnection);
             mIsBound = false;
         }
+        stopService(new Intent(this, SickbayPushService.class));
 
         //Connecting
         closeAllConnections();
@@ -461,8 +463,11 @@ public class BLEHandlerService extends Service {
             connectDevice(address);
 
         if(pushToSickbay) {
-            //Start and bind to the SickbayPushService
+            //Explicitly START the SickbayPushService (as a foreground service) BEFORE binding so
+            //its lifetime is independent of the binding and it owns its own foreground/wake-lock
+            //lifecycle. BIND_AUTO_CREATE alone would tear it down with the last unbind.
             Intent intent = new Intent(this, SickbayPushService.class);
+            ContextCompat.startForegroundService(this, intent);
             bindService(intent, sickbayPushConnection, Context.BIND_AUTO_CREATE);
             EventBus.getDefault().post(new SickbayReinitializeEvent());
         }
@@ -548,6 +553,14 @@ public class BLEHandlerService extends Service {
 
         if (mConnectionManager.getBLEDevices().size() == 0) {
             stopForeground(true);
+
+            //No BLE devices left -> nothing to stream. Stop Sickbay so it releases its
+            //WiFi + partial wake locks instead of holding the CPU awake indefinitely.
+            if (mIsBound) {
+                unbindService(sickbayPushConnection);
+                mIsBound = false;
+            }
+            stopService(new Intent(this, SickbayPushService.class));
 
             // If user *explicitly* requested, don't alarm. Otherwise, alarm.
             if (mUserRequestedDisconnect) {

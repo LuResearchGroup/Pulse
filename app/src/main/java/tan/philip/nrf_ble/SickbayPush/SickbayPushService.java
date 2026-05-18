@@ -1,17 +1,25 @@
 package tan.philip.nrf_ble.SickbayPush;
 
 import static android.net.wifi.WifiManager.WIFI_MODE_FULL_LOW_LATENCY;
+import static tan.philip.nrf_ble.NotificationHandler.CHANNEL_ID;
+import static tan.philip.nrf_ble.NotificationHandler.FOREGROUND_SERVICE_NOTIFICATION_ID_SICKBAY;
 import static tan.philip.nrf_ble.SickbayPush.SickbayMessage.convertPacketToJSONString;
 
+import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
+import android.content.pm.ServiceInfo;
 import android.net.wifi.WifiManager;
 import android.os.Binder;
+import android.os.Build;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.IBinder;
+import android.os.PowerManager;
 import android.util.Log;
+
+import androidx.core.app.NotificationCompat;
 
 import org.greenrobot.eventbus.EventBus;
 import org.greenrobot.eventbus.Subscribe;
@@ -29,6 +37,8 @@ import io.socket.client.IO;
 import io.socket.client.Socket;
 import io.socket.emitter.Emitter;
 import tan.philip.nrf_ble.BLE.BLEDevices.BLEDevice;
+import tan.philip.nrf_ble.R;
+import tan.philip.nrf_ble.GraphScreen.GraphActivity;
 import tan.philip.nrf_ble.Events.Sickbay.SickbayQueueEvent;
 import tan.philip.nrf_ble.Events.Sickbay.SickbayReinitializeEvent;
 import tan.philip.nrf_ble.Events.Sickbay.SickbaySendFloatsEvent;
@@ -59,6 +69,12 @@ public class SickbayPushService extends Service {
     //handling WiFi.
     WifiManager mWifiManager;// = (WifiManager) this.getSystemService(Context.WIFI_SERVICE);
     WifiManager.WifiLock mWifiLock;// = mWifiManager.createWifiLock(WIFI_MODE_FULL_LOW_LATENCY, WIFI_TAG);
+
+    //Partial wake lock. Keeps the CPU running while we are actively streaming to the socket so
+    //the Socket.IO heartbeat/emit threads keep firing when the screen is off / device is dozing.
+    //Acquired and released in lockstep with the WiFi lock so it can never leak.
+    private static final String WAKE_TAG = "Pulse:SickbayPushWakeLock";
+    private PowerManager.WakeLock mWakeLock;
     public class LocalBinder extends Binder {
         public SickbayPushService getService() {
             // Return this instance of SickbayPushService so clients can call public methods
@@ -72,6 +88,38 @@ public class SickbayPushService extends Service {
     }
 
     @Override
+    public int onStartCommand(Intent intent, int flags, int startId) {
+        //Promote to a real foreground service so the OS keeps it (and the network/wake locks)
+        //alive when the screen is off. Must call startForeground() promptly after being started
+        //with startForegroundService().
+        startForegroundNotification();
+
+        //If the system kills us under memory pressure while streaming, recreate the service.
+        return START_STICKY;
+    }
+
+    private void startForegroundNotification() {
+        PendingIntent contentPI = PendingIntent.getActivity(
+                this, 0, new Intent(this, GraphActivity.class),
+                PendingIntent.FLAG_UPDATE_CURRENT |
+                        (Build.VERSION.SDK_INT >= 23 ? PendingIntent.FLAG_IMMUTABLE : 0));
+
+        NotificationCompat.Builder nb = new NotificationCompat.Builder(this, CHANNEL_ID)
+                .setSmallIcon(R.drawable.heartrate)
+                .setContentTitle("Streaming to Sickbay")
+                .setContentText("Forwarding device data to " + webSocketURL)
+                .setOngoing(true)
+                .setContentIntent(contentPI);
+
+        if (Build.VERSION.SDK_INT >= 34) {
+            startForeground(FOREGROUND_SERVICE_NOTIFICATION_ID_SICKBAY, nb.build(),
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
+        } else {
+            startForeground(FOREGROUND_SERVICE_NOTIFICATION_ID_SICKBAY, nb.build());
+        }
+    }
+
+    @Override
     public void onCreate() {
         initializeSickbaySettings();
 
@@ -82,7 +130,10 @@ public class SickbayPushService extends Service {
     @Override
     public void onDestroy() {
         disconnectSocket();
-        releaseWifiLock();
+        releaseStreamingLocks();
+
+        //Drop foreground status / notification.
+        stopForeground(true);
 
         //Unregister from EventBus
         EventBus.getDefault().unregister(this);
@@ -97,9 +148,19 @@ public class SickbayPushService extends Service {
         mHandler = new Handler();
         connectSocket();
 
+        //Release any previously held locks before re-creating them (this method can be
+        //re-entered via SickbayReinitializeEvent) so we never leak a held lock.
+        releaseStreamingLocks();
+
         //No need to have WiFi lock on to start probably
         mWifiManager = (WifiManager) this.getSystemService(Context.WIFI_SERVICE);
         mWifiLock = mWifiManager.createWifiLock(WIFI_MODE_FULL_LOW_LATENCY, WIFI_TAG);
+
+        //Create (but do not yet acquire) the partial wake lock.
+        PowerManager pm = (PowerManager) this.getSystemService(Context.POWER_SERVICE);
+        mWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKE_TAG);
+        mWakeLock.setReferenceCounted(false);
+
         releaseWifiLock();
     }
 
@@ -312,14 +373,30 @@ public class SickbayPushService extends Service {
         }
     };
 
-    private void releaseWifiLock() {
-        if(mWifiLock != null && mWifiLock.isHeld())
+    //Acquire the WiFi + partial wake locks together. Called when the socket connects, i.e. when
+    //the data stream actually starts. Idempotent (locks are not reference counted).
+    private void acquireStreamingLocks() {
+        if (mWifiLock != null && !mWifiLock.isHeld())
+            mWifiLock.acquire();
+        if (mWakeLock != null && !mWakeLock.isHeld())
+            mWakeLock.acquire();
+    }
+
+    //Release the WiFi + partial wake locks together. Called on socket disconnect and onDestroy so
+    //the CPU is never held awake once we stop streaming (prevents permanent battery drain).
+    private void releaseStreamingLocks() {
+        if (mWifiLock != null && mWifiLock.isHeld())
             mWifiLock.release();
+        if (mWakeLock != null && mWakeLock.isHeld())
+            mWakeLock.release();
+    }
+
+    private void releaseWifiLock() {
+        releaseStreamingLocks();
     }
 
     private void acquireWifiLock() {
-        if(mWifiLock != null && !mWifiLock.isHeld())
-            mWifiLock.acquire();
+        acquireStreamingLocks();
     }
 
 }

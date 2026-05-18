@@ -20,6 +20,7 @@ public class NotificationHandler {
 
   public static final int NOTIFICATION_ID = 1;                           //Used if we want to update or remove notification
   public static final int FOREGROUND_SERVICE_NOTIFICATION_ID = 2;        //Notification ID of the BLEHandlerService
+  public static final int FOREGROUND_SERVICE_NOTIFICATION_ID_SICKBAY = 3;//Notification ID of the SickbayPushService
 
   private static NotificationManager notificationManager;
 
